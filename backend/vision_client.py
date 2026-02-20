@@ -19,7 +19,7 @@ class VisionLLMClient:
 
     def __init__(self):
         self.api_key = os.getenv("VISION_API_KEY")
-        self.model_name = "gemini-1.5-flash"
+        self.model_name = "gemini-2.0-flash"  
 
         if not self.api_key:
             raise ValueError("VISION_API_KEY must be set in .env file")
