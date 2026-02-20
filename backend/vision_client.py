@@ -1,111 +1,116 @@
 """
-Vision API wrapper for multimodal model integration.
-Handles streaming communication with the multimodal API.
+Vision API wrapper using Google Gemini for multimodal model integration.
+Handles streaming communication with Gemini Vision API.
 """
 import os
-import json
-import requests
+import base64
 from typing import Dict, List, Any, Iterator
 from dotenv import load_dotenv
+import google.generativeai as genai
 
-# Load environment variables
 load_dotenv()
 
 
 class VisionLLMClient:
     """
-    Minimal wrapper for the hosted vision model.
-    Responsibility: Stream tokens from the Vision API, nothing else.
+    Gemini-based wrapper for vision model.
+    Drop-in replacement for the Qubrid client.
     """
-    
+
     def __init__(self):
-        """Initialize with API credentials from environment."""
         self.api_key = os.getenv("VISION_API_KEY")
-        self.api_base = os.getenv(
-            "VISION_API_BASE", 
-            "https://platform.qubrid.com/api/v1/qubridai/multimodal/chat"
-        )
-        self.model_name = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-        
+        self.model_name = "gemini-1.5-flash"
+
         if not self.api_key:
             raise ValueError("VISION_API_KEY must be set in .env file")
-    
+
+        genai.configure(api_key=self.api_key)
+        self.model = genai.GenerativeModel(self.model_name)
+
     def stream(
-        self, 
-        messages: List[Dict[str, Any]], 
+        self,
+        messages: List[Dict[str, Any]],
         temperature: float = 0.7,
         max_tokens: int = 1024,
-        top_p: float = 0.9,
-        top_k: int = 40,
-        presence_penalty: float = 0.0,
         **kwargs
     ) -> Iterator[str]:
         """
-        Stream tokens from the Vision API.
-        
-        Args:
-            messages: List of message dicts in OpenAI format
-            temperature: Sampling temperature (0.0-2.0)
-            max_tokens: Maximum tokens to generate
-            top_p: Nucleus sampling threshold
-            top_k: Top-k sampling limit
-            presence_penalty: Penalty for token presence
-            
-        Yields:
-            Content chunks as they arrive from the API
-            
-        Raises:
-            requests.HTTPError: If API request fails
+        Stream tokens from Gemini API.
+        Converts OpenAI-format messages to Gemini format.
         """
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "top_p": top_p,
-            "stream": True,
-        }
-        
-        response = requests.post(
-            self.api_base, 
-            headers=headers, 
-            json=payload, 
-            stream=True,
-            timeout=60
+        # Extract system prompt
+        system_prompt = ""
+        gemini_parts = []
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "system":
+                # Collect system prompt as text
+                if isinstance(content, list):
+                    for part in content:
+                        if part.get("type") == "text":
+                            system_prompt += part["text"] + "\n"
+                else:
+                    system_prompt += str(content) + "\n"
+
+            elif role == "user":
+                if isinstance(content, list):
+                    for part in content:
+                        if part.get("type") == "text":
+                            gemini_parts.append(part["text"])
+                        elif part.get("type") == "image_url":
+                            image_url = part["image_url"]["url"]
+                            # Handle base64 data URI
+                            if image_url.startswith("data:image"):
+                                header, b64data = image_url.split(",", 1)
+                                mime_type = header.split(";")[0].split(":")[1]
+                                image_bytes = base64.b64decode(b64data)
+                                gemini_parts.append({
+                                    "mime_type": mime_type,
+                                    "data": image_bytes
+                                })
+                else:
+                    gemini_parts.append(str(content))
+
+            elif role == "assistant":
+                # Skip assistant messages for now (single turn)
+                pass
+
+        # Prepend system prompt to first text part
+        if system_prompt:
+            gemini_parts.insert(0, system_prompt)
+
+        # Build Gemini-format contents
+        gemini_contents = []
+        for part in gemini_parts:
+            if isinstance(part, str):
+                gemini_contents.append(part)
+            elif isinstance(part, dict):
+                # Image part
+                import google.generativeai as genai_img
+                gemini_contents.append(
+                    genai_img.protos.Blob(
+                        mime_type=part["mime_type"],
+                        data=part["data"]
+                    )
+                )
+
+        generation_config = genai.types.GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
         )
-        if response.status_code != 200:
-            error_msg = f"API Error {response.status_code}: {response.text}"
-            print(error_msg)
-            raise ValueError(error_msg)
-        
-        # Parse Server-Sent Events (SSE)
-        for line in response.iter_lines():
-            if not line:
-                continue
-                
-            decoded_line = line.decode("utf-8")
-            
-            # SSE format: "data: {json}"
-            if not decoded_line.startswith("data: "):
-                continue
-            
-            json_str = decoded_line[6:]  # Remove "data: " prefix
-            
-            # Check for stream end signal
-            if json_str.strip() == "[DONE]":
-                break
-            
-            # Parse and extract content
+
+        response = self.model.generate_content(
+            gemini_contents,
+            generation_config=generation_config,
+            stream=True
+        )
+
+        for chunk in response:
             try:
-                chunk = json.loads(json_str)
-                content = chunk["choices"][0]["delta"].get("content", "")
-                if content:
-                    yield content
-            except (json.JSONDecodeError, KeyError, IndexError):
-                # Skip malformed chunks
+                if chunk.text:
+                    yield chunk.text
+            except Exception:
                 continue
